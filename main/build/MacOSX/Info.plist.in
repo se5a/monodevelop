@@ -294,5 +294,12 @@
 		<string>zh-Hans</string>
 		<string>zh-Hant</string>
 	</array>
+	<key>NSAppleEventsUsageDescription</key>
+        <string>@APP_NAME@ needs to control applications through AppleScript</string>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsArbitraryLoads</key>
+		<true/>
+	</dict>
 </dict>
 </plist>

@@ -69,7 +69,7 @@ namespace MonoDevelop.PackageManagement.Tests
 			solution = (Solution)await Services.ProjectService.ReadWorkspaceItem (Util.GetMonitor (), solutionFileName);
 			var project = solution.GetAllDotNetProjects ().Single ();
 
-			using (var logger = new PackagManagementEventsConsoleLogger ()) {
+			using (var logger = new PackageManagementEventsConsoleLogger ()) {
 				await RestoreDotNetCoreNuGetPackages (solution);
 			}
 

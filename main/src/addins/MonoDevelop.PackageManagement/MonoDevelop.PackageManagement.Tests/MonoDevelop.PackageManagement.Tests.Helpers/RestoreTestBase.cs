@@ -30,6 +30,7 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using MonoDevelop.Core;
+using MonoDevelop.Ide;
 using MonoDevelop.Projects;
 using NuGet.Configuration;
 using NuGet.PackageManagement;
@@ -45,6 +46,14 @@ namespace MonoDevelop.PackageManagement.Tests.Helpers
 	public abstract class RestoreTestBase : TestBase
 	{
 		protected Solution solution;
+
+		protected override void InternalSetup (string rootDir)
+		{
+			base.InternalSetup (rootDir);
+			Xwt.Application.Initialize (Xwt.ToolkitType.Gtk);
+			Gtk.Application.Init ();
+			DesktopService.Initialize ();
+		}
 
 		[TearDown]
 		public void TearDownTest ()
@@ -118,9 +127,9 @@ namespace MonoDevelop.PackageManagement.Tests.Helpers
 			return context;
 		}
 
-		protected class PackagManagementEventsConsoleLogger : IDisposable
+		protected class PackageManagementEventsConsoleLogger : IDisposable
 		{
-			public PackagManagementEventsConsoleLogger ()
+			public PackageManagementEventsConsoleLogger ()
 			{
 				PackageManagementServices.PackageManagementEvents.PackageOperationMessageLogged += PackageOperationMessageLogged;
 			}

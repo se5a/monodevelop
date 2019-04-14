@@ -2772,6 +2772,9 @@ namespace MonoDevelop.Projects
 			// Read available item types
 
 			loadedAvailableItemNames = msproject.EvaluatedItems.Where (i => i.Name == "AvailableItemName").Select (i => i.Include).ToArray ();
+
+			// Ensure buildActions are refreshed if loadedAvailableItemNames have been updated.
+			buildActions = null;
 		}
 
 		List<ConfigData> GetConfigData (MSBuildProject msproject, bool includeEvaluated)
@@ -4216,6 +4219,11 @@ namespace MonoDevelop.Projects
 					try {
 						IsReevaluating = true;
 
+						// Re-evaluating may change MSBuild items and cause the custom tool generator to run. If a
+						// custom MSBuild target is run it may run before the project builder is refreshed so the
+						// target may not available. To avoid this shutdown the project builder before re-evaluating.
+						ShutdownProjectBuilder ();
+
 						// Reevaluate the msbuild project
 						monitorItemsModifiedDuringReevaluation = true;
 						await sourceProject.EvaluateAsync ();
@@ -4409,7 +4417,7 @@ namespace MonoDevelop.Projects
 
 		void OnFileRenamed (object sender, FileCopyEventArgs e)
 		{
-			foreach (FileCopyEventInfo info in e) {
+			foreach (FileEventInfo info in e) {
 				OnFileRenamed (info.SourceFile, info.TargetFile);
 			}
 		}
@@ -4528,6 +4536,13 @@ namespace MonoDevelop.Projects
 
 		void OnFileCreatedExternally (FilePath fileName)
 		{
+			if (sourceProject == null) {
+				// sometimes this method is called after disposing this class. 
+				// (i.e. when quitting MD or creating a new project.)
+				LoggingService.LogWarning ("File created externally not processed. {0}", fileName);
+				return;
+			}
+
 			// Check file is inside the project directory. The file globs would exclude the file anyway
 			// if the relative path starts with "..\" but checking here avoids checking the file globs.
 			if (!fileName.IsChildPathOf (BaseDirectory))

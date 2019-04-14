@@ -70,7 +70,7 @@ namespace MonoDevelop.Ide.Gui
 		DefaultWorkbench workbench;
 		PadCollection pads;
 
-		public event EventHandler ActiveDocumentChanged;
+		public event EventHandler<DocumentEventArgs> ActiveDocumentChanged;
 		public event EventHandler LayoutChanged;
 		public event EventHandler GuiLocked;
 		public event EventHandler GuiUnlocked;
@@ -414,12 +414,6 @@ namespace MonoDevelop.Ide.Gui
 					: System.IO.Path.GetFileName (doc.Window.ViewContent.ContentName))),
 				GettextCatalog.GetString ("If you don't save, all changes will be permanently lost."),
 				AlertButton.CloseWithoutSave, AlertButton.Cancel, doc.Window.ViewContent.IsUntitled ? AlertButton.SaveAs : AlertButton.Save);
-		}
-
-		[Obsolete("Use CloseAllDocumentsAsync")]
-		public void CloseAllDocuments (bool leaveActiveDocumentOpen)
-		{
-			CloseAllDocumentsAsync (leaveActiveDocumentOpen).Ignore ();
 		}
 
 		public async Task CloseAllDocumentsAsync (bool leaveActiveDocumentOpen)
@@ -793,7 +787,7 @@ namespace MonoDevelop.Ide.Gui
 		public void ShowDefaultPoliciesDialog (Window parentWindow, string panelId)
 		{
 			if (parentWindow == null)
-				parentWindow = IdeApp.Workbench.RootWindow;
+				parentWindow = DesktopService.GetFocusedTopLevelWindow ();
 
 			var ops = new DefaultPolicyOptionsDialog (parentWindow);
 
@@ -864,10 +858,12 @@ namespace MonoDevelop.Ide.Gui
 		
 		void OnDocumentChanged (object s, EventArgs a)
 		{
-			if (ActiveDocumentChanged != null)
-				ActiveDocumentChanged (s, a);
-			if (ActiveDocument != null)
-				ActiveDocument.LastTimeActive = DateTime.Now;
+			var activeDoc = ActiveDocument;
+
+			ActiveDocumentChanged?.Invoke (s, new DocumentEventArgs (activeDoc));
+
+			if (activeDoc != null)
+				activeDoc.LastTimeActive = DateTime.Now;
 		}
 		
 		internal Document WrapDocument (IWorkbenchWindow window)

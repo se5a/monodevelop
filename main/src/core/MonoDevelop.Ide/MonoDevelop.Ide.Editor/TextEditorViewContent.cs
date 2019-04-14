@@ -83,7 +83,8 @@ namespace MonoDevelop.Ide.Editor
 			base.OnContentNameChanged ();
 			if (ContentName != textEditorImpl.ContentName && !string.IsNullOrEmpty (textEditorImpl.ContentName))
 				AutoSave.RemoveAutoSaveFile (textEditorImpl.ContentName);
-			textEditor.FileName = ContentName;
+			if (ContentName != null) // Happens when a file is converted to an untitled file, but even in that case the text editor should be associated with the old location, otherwise typing can be messed up due to change of .editconfig settings etc.
+				textEditor.FileName = ContentName;
 			if (this.WorkbenchWindow?.Document != null)
 				textEditor.InitializeExtensionChain (this.WorkbenchWindow.Document);
 			UpdateTextEditorOptions (null, null);
@@ -110,9 +111,12 @@ namespace MonoDevelop.Ide.Editor
 			InformAutoSave ();
 		}
 
+		CancellationTokenSource editorOptionsUpdateCancellationSource;
 		void UpdateTextEditorOptions (object sender, EventArgs e)
 		{
-			UpdateStyleParent (Project, textEditor.MimeType).Ignore ();
+			editorOptionsUpdateCancellationSource?.Cancel ();
+			editorOptionsUpdateCancellationSource = new CancellationTokenSource ();
+			UpdateStyleParent (Project, textEditor.MimeType, editorOptionsUpdateCancellationSource.Token).Ignore ();
 		}
 
 		uint autoSaveTimer = 0;
@@ -147,7 +151,7 @@ namespace MonoDevelop.Ide.Editor
 				policyContainer.PolicyChanged -= HandlePolicyChanged;
 		}
 
-		async Task UpdateStyleParent (MonoDevelop.Projects.Project styleParent, string mimeType)
+		async Task UpdateStyleParent (MonoDevelop.Projects.Project styleParent, string mimeType, CancellationToken token)
 		{
 			RemovePolicyChangeHandler ();
 
@@ -164,7 +168,7 @@ namespace MonoDevelop.Ide.Editor
 			policyContainer.PolicyChanged += HandlePolicyChanged;
 			((DefaultSourceEditorOptions)textEditor.Options).UpdateStylePolicy (currentPolicy);
 
-			var context = await EditorConfigService.GetEditorConfigContext (textEditor.FileName, default (CancellationToken));
+			var context = await EditorConfigService.GetEditorConfigContext (textEditor.FileName, token);
 			if (context == null)
 				return;
 			((DefaultSourceEditorOptions)textEditor.Options).SetContext (context);
@@ -357,6 +361,7 @@ namespace MonoDevelop.Ide.Editor
 
 			DefaultSourceEditorOptions.Instance.Changed -= UpdateTextEditorOptions;
 			RemovePolicyChangeHandler ();
+			editorOptionsUpdateCancellationSource?.Cancel ();
 			RemoveAutoSaveTimer ();
 			textEditor.Dispose ();
 		}
@@ -371,8 +376,10 @@ namespace MonoDevelop.Ide.Editor
 		}
 
 		#endregion
-	
 
-
+		public override void GrabFocus ()
+		{
+			textEditor.GrabFocus ();
+		}
 	}
 }

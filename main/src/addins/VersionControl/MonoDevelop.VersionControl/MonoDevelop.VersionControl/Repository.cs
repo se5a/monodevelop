@@ -89,20 +89,35 @@ namespace MonoDevelop.VersionControl
 				Dispose ();
 		}
 
-		internal bool Disposed { get; private set; }
-		public virtual void Dispose ()
-		{
-			Disposed = true;
-			if (!queryRunning)
-				return;
+		public bool IsDisposed { get; protected set; }
 
-			lock (queryLock) {
-				fileQueryQueue.Clear ();
-				directoryQueryQueue.Clear ();
-				recursiveDirectoryQueryQueue.Clear ();
+		protected virtual void Dispose (bool disposing)
+		{
+			IsDisposed = true;
+
+			if (queryRunning) {
+				lock (queryLock) {
+					fileQueryQueue.Clear ();
+					directoryQueryQueue.Clear ();
+					recursiveDirectoryQueryQueue.Clear ();
+				}
 			}
+
+			infoCache?.Dispose ();
+			infoCache = null;
 		}
-		
+
+		public void Dispose ()
+		{
+			Dispose (true);
+			GC.SuppressFinalize (this);
+		}
+
+		~Repository ()
+		{
+			Dispose (false);
+		}
+
 		// Display name of the repository
 		[ItemProperty]
 		public string Name	{
@@ -225,6 +240,8 @@ namespace MonoDevelop.VersionControl
 			if ((queryFlags & VersionInfoQueryFlags.IgnoreCache) != 0) {
 				// We shouldn't use IEnumerable because elements don't save property modifications.
 				var res = OnGetVersionInfo (paths, (queryFlags & VersionInfoQueryFlags.IncludeRemoteStatus) != 0).ToList ();
+				foreach (var vi in res)
+					if (!vi.IsInitialized) vi.Init (this);
 				infoCache.SetStatus (res);
 				return res;
 			}
@@ -409,24 +426,30 @@ namespace MonoDevelop.VersionControl
 					// new queries to the queue while long-running VCS operations are being performed
 					var groups = fileQueryQueueClone.GroupBy (q => (q.QueryFlags & VersionInfoQueryFlags.IncludeRemoteStatus) != 0);
 					foreach (var group in groups) {
-						if (Disposed)
+						if (IsDisposed)
 							break;
-						var status = OnGetVersionInfo (group.SelectMany (q => q.Paths), group.Key);
+						var status = OnGetVersionInfo (group.SelectMany (q => q.Paths), group.Key).ToList ();
+						foreach (var vi in status)
+							if (!vi.IsInitialized) vi.Init (this);
 						infoCache.SetStatus (status);
 					}
 
 					foreach (var item in directoryQueryQueueClone) {
-						if (Disposed)
+						if (IsDisposed)
 							break;
 						var status = OnGetDirectoryVersionInfo (item.Directory, item.GetRemoteStatus, false);
+						foreach (var vi in status)
+							if (!vi.IsInitialized) vi.Init (this);
 						infoCache.SetDirectoryStatus (item.Directory, status, item.GetRemoteStatus);
 					}
 
 					foreach (var item in recursiveDirectoryQueryQueueClone) {
 						try {
-							if (Disposed)
+							if (IsDisposed)
 								continue;
 							item.Result = OnGetDirectoryVersionInfo (item.Directory, item.GetRemoteStatus, true);
+							foreach (var vi in item.Result)
+								if (!vi.IsInitialized) vi.Init (this);
 						} finally {
 							item.ResetEvent.Set ();
 						}
@@ -468,7 +491,14 @@ namespace MonoDevelop.VersionControl
 		/// </param>
 		public RevisionPath[] GetRevisionChanges (Revision revision)
 		{
-			return OnGetRevisionChanges (revision);
+			using (var tracker = Instrumentation.GetRevisionChangesCounter.BeginTiming (new RepositoryMetadata (VersionControlSystem))) {
+				try {
+					return OnGetRevisionChanges (revision);
+				} catch {
+					tracker.Metadata.SetFailure ();
+					throw;
+				}
+			}
 		}
 		
 		
@@ -478,7 +508,14 @@ namespace MonoDevelop.VersionControl
 		// Returns the revision history of a file
 		public Revision[] GetHistory (FilePath localFile, Revision since)
 		{
-			return OnGetHistory (localFile, since);
+			using (var tracker = Instrumentation.GetHistoryCounter.BeginTiming (new RepositoryMetadata (VersionControlSystem))) {
+				try {
+					return OnGetHistory (localFile, since);
+				} catch {
+					tracker.Metadata.SetFailure ();
+					throw;
+				}
+			}
 		}
 
 		protected abstract Revision[] OnGetHistory (FilePath localFile, Revision since);
@@ -505,9 +542,17 @@ namespace MonoDevelop.VersionControl
 		// repository directory (must use absolute local paths).
 		public Repository Publish (string serverPath, FilePath localPath, FilePath[] files, string message, ProgressMonitor monitor)
 		{
-			var res = OnPublish (serverPath, localPath, files, message, monitor);
-			ClearCachedVersionInfo (localPath);
-			return res;
+			var metadata = new PublishMetadata (VersionControlSystem) { PathsCount = files.Length, SubFolder = !RootPath.IsNullOrEmpty && localPath.IsChildPathOf(RootPath) };
+			using (var tracker = Instrumentation.PublishCounter.BeginTiming (metadata, monitor.CancellationToken)) {
+				try {
+					var res = OnPublish (serverPath, localPath, files, message, monitor);
+					ClearCachedVersionInfo (localPath);
+					return res;
+				} catch {
+					metadata.SetFailure ();
+					throw;
+				}
+			}
 		}
 		
 		protected abstract Repository OnPublish (string serverPath, FilePath localPath, FilePath[] files, string message, ProgressMonitor monitor);
@@ -521,8 +566,16 @@ namespace MonoDevelop.VersionControl
 
 		public void Update (FilePath[] localPaths, bool recurse, ProgressMonitor monitor)
 		{
-			OnUpdate (localPaths, recurse, monitor);
-			ClearCachedVersionInfo (localPaths);
+			var metadata = new MultipathOperationMetadata (VersionControlSystem) { PathsCount = localPaths.Length, Recursive = recurse };
+			using (var tracker = Instrumentation.UpdateCounter.BeginTiming (metadata, monitor.CancellationToken)) {
+				try {
+					OnUpdate (localPaths, recurse, monitor);
+					ClearCachedVersionInfo (localPaths);
+				} catch {
+					metadata.SetFailure ();
+					throw;
+				}
+			}
 		}
 		
 		protected abstract void OnUpdate (FilePath[] localPaths, bool recurse, ProgressMonitor monitor);
@@ -553,8 +606,16 @@ namespace MonoDevelop.VersionControl
 		// Commits changes in a set of files or directories into the repository
 		public void Commit (ChangeSet changeSet, ProgressMonitor monitor)
 		{
-			ClearCachedVersionInfo (changeSet.BaseLocalPath);
-			OnCommit (changeSet, monitor);
+			var metadata = new MultipathOperationMetadata (VersionControlSystem) { PathsCount = changeSet.Count };
+			using (var tracker = Instrumentation.CommitCounter.BeginTiming (metadata, monitor.CancellationToken)) {
+				try {
+					ClearCachedVersionInfo (changeSet.BaseLocalPath);
+					OnCommit (changeSet, monitor);
+				} catch {
+					metadata.SetFailure ();
+					throw;
+				}
+			}
 		}
 		
 		protected abstract void OnCommit (ChangeSet changeSet, ProgressMonitor monitor);
@@ -567,16 +628,37 @@ namespace MonoDevelop.VersionControl
 
 		public void Checkout (FilePath targetLocalPath, Revision rev, bool recurse, ProgressMonitor monitor)
 		{
-			ClearCachedVersionInfo (targetLocalPath);
-			OnCheckout (targetLocalPath, rev, recurse, monitor);
+			var metadata = new MultipathOperationMetadata (VersionControlSystem) { Recursive = recurse };
+			using (var tracker = Instrumentation.CheckoutCounter.BeginTiming (metadata, monitor.CancellationToken)) {
+				try {
+					ClearCachedVersionInfo (targetLocalPath);
+					OnCheckout (targetLocalPath, rev, recurse, monitor);
+
+					if (!Directory.Exists (targetLocalPath))
+						metadata.SetFailure ();
+					else
+						metadata.SetSuccess ();
+				} catch {
+					metadata.SetFailure ();
+					throw;
+				}
+			}
 		}
 
 		protected abstract void OnCheckout (FilePath targetLocalPath, Revision rev, bool recurse, ProgressMonitor monitor);
 
 		public void Revert (FilePath[] localPaths, bool recurse, ProgressMonitor monitor)
 		{
-			ClearCachedVersionInfo (localPaths);
-			OnRevert (localPaths, recurse, monitor);
+			var metadata = new RevertMetadata (VersionControlSystem) { PathsCount = localPaths.Length, Recursive = recurse, OperationType = RevertMetadata.RevertType.LocalChanges };
+			using (var tracker = Instrumentation.RevertCounter.BeginTiming (metadata, monitor.CancellationToken)) {
+				try {
+					ClearCachedVersionInfo (localPaths);
+					OnRevert (localPaths, recurse, monitor);
+				} catch {
+					metadata.SetFailure ();
+					throw;
+				}
+			}
 		}
 
 		public void Revert (FilePath localPath, bool recurse, ProgressMonitor monitor)
@@ -588,16 +670,32 @@ namespace MonoDevelop.VersionControl
 
 		public void RevertRevision (FilePath localPath, Revision revision, ProgressMonitor monitor)
 		{
-			ClearCachedVersionInfo (localPath);
-			OnRevertRevision (localPath, revision, monitor);
+			var metadata = new RevertMetadata (VersionControlSystem) { PathsCount = 1, Recursive = true, OperationType = RevertMetadata.RevertType.SpecificRevision };
+			using (var tracker = Instrumentation.RevertCounter.BeginTiming (metadata, monitor.CancellationToken)) {
+				try {
+					ClearCachedVersionInfo (localPath);
+					OnRevertRevision (localPath, revision, monitor);
+				} catch {
+					metadata.SetFailure ();
+					throw;
+				}
+			}
 		}
 
 		protected abstract void OnRevertRevision (FilePath localPath, Revision revision, ProgressMonitor monitor);
 
 		public void RevertToRevision (FilePath localPath, Revision revision, ProgressMonitor monitor)
 		{
-			ClearCachedVersionInfo (localPath);
-			OnRevertToRevision (localPath, revision, monitor);
+			var metadata = new RevertMetadata (VersionControlSystem) { PathsCount = 1, Recursive = true, OperationType = RevertMetadata.RevertType.ToRevision };
+			using (var tracker = Instrumentation.RevertCounter.BeginTiming (metadata, monitor.CancellationToken)) {
+				try {
+					ClearCachedVersionInfo (localPath);
+					OnRevertToRevision (localPath, revision, monitor);
+				} catch {
+					metadata.SetFailure ();
+					throw;
+				}
+			}
 		}
 		
 		protected abstract void OnRevertToRevision (FilePath localPath, Revision revision, ProgressMonitor monitor);
@@ -610,12 +708,17 @@ namespace MonoDevelop.VersionControl
 
 		public void Add (FilePath[] localPaths, bool recurse, ProgressMonitor monitor)
 		{
-			try {
-				OnAdd (localPaths, recurse, monitor);
-			} catch (Exception e) {
-				LoggingService.LogError ("Failed to add file", e);
+			var metadata = new MultipathOperationMetadata (VersionControlSystem) { PathsCount = localPaths.Length, Recursive = recurse };
+			using (var tracker = Instrumentation.AddCounter.BeginTiming (metadata, monitor.CancellationToken)) {
+				try {
+					OnAdd (localPaths, recurse, monitor);
+				} catch (Exception e) {
+					LoggingService.LogError ("Failed to add file", e);
+					metadata.SetFailure ();
+				} finally {
+					ClearCachedVersionInfo (localPaths);
+				}
 			}
-			ClearCachedVersionInfo (localPaths);
 		}
 
 		protected abstract void OnAdd (FilePath[] localPaths, bool recurse, ProgressMonitor monitor);
@@ -635,11 +738,15 @@ namespace MonoDevelop.VersionControl
 		public void MoveFile (FilePath localSrcPath, FilePath localDestPath, bool force, ProgressMonitor monitor)
 		{
 			ClearCachedVersionInfo (localSrcPath, localDestPath);
-			try {
-				OnMoveFile (localSrcPath, localDestPath, force, monitor);
-			} catch (Exception e) {
-				LoggingService.LogError ("Failed to move file", e);
-				File.Move (localSrcPath, localDestPath);
+			var metadata = new MoveMetadata (VersionControlSystem) { Force = force, OperationType = MoveMetadata.MoveType.File };
+			using (var tracker = Instrumentation.MoveCounter.BeginTiming (metadata, monitor.CancellationToken)) {
+				try {
+					OnMoveFile (localSrcPath, localDestPath, force, monitor);
+				} catch (Exception e) {
+					LoggingService.LogError ("Failed to move file", e);
+					metadata.SetFailure ();
+					File.Move (localSrcPath, localDestPath);
+				}
 			}
 		}
 		
@@ -653,11 +760,15 @@ namespace MonoDevelop.VersionControl
 		public void MoveDirectory (FilePath localSrcPath, FilePath localDestPath, bool force, ProgressMonitor monitor)
 		{
 			ClearCachedVersionInfo (localSrcPath, localDestPath);
-			try {
-				OnMoveDirectory (localSrcPath, localDestPath, force, monitor);
-			} catch (Exception e) {
-				LoggingService.LogError ("Failed to move directory", e);
-				FileService.SystemDirectoryRename (localSrcPath, localDestPath);
+			var metadata = new MoveMetadata (VersionControlSystem) { Force = force, OperationType = MoveMetadata.MoveType.Directory };
+			using (var tracker = Instrumentation.MoveCounter.BeginTiming (metadata, monitor.CancellationToken)) {
+				try {
+					OnMoveDirectory (localSrcPath, localDestPath, force, monitor);
+				} catch (Exception e) {
+					LoggingService.LogError ("Failed to move directory", e);
+					metadata.SetFailure ();
+					FileService.SystemDirectoryRename (localSrcPath, localDestPath);
+				}
 			}
 		}
 		
@@ -675,13 +786,17 @@ namespace MonoDevelop.VersionControl
 
 		public void DeleteFiles (FilePath[] localPaths, bool force, ProgressMonitor monitor, bool keepLocal = true)
 		{
-			try {
-				OnDeleteFiles (localPaths, force, monitor, keepLocal);
-			} catch (Exception e) {
-				LoggingService.LogError ("Failed to delete file", e);
-				if (!keepLocal)
-					foreach (var path in localPaths)
-						File.Delete (path);
+			var metadata = new DeleteMetadata (VersionControlSystem) { PathsCount = localPaths.Length, Force = force, KeepLocal = keepLocal };
+			using (var tracker = Instrumentation.DeleteCounter.BeginTiming (metadata, monitor.CancellationToken)) {
+				try {
+					OnDeleteFiles (localPaths, force, monitor, keepLocal);
+				} catch (Exception e) {
+					LoggingService.LogError ("Failed to delete file", e);
+					metadata.SetFailure ();
+					if (!keepLocal)
+						foreach (var path in localPaths)
+							File.Delete (path);
+				}
 			}
 			ClearCachedVersionInfo (localPaths);
 		}
@@ -695,13 +810,17 @@ namespace MonoDevelop.VersionControl
 
 		public void DeleteDirectories (FilePath[] localPaths, bool force, ProgressMonitor monitor, bool keepLocal = true)
 		{
-			try {
-				OnDeleteDirectories (localPaths, force, monitor, keepLocal);
-			} catch (Exception e) {
-				LoggingService.LogError ("Failed to delete directory", e);
-				if (!keepLocal)
-					foreach (var path in localPaths)
-						Directory.Delete (path, true);
+			var metadata = new DeleteMetadata (VersionControlSystem) { PathsCount = localPaths.Length, Force = force, KeepLocal = keepLocal };
+			using (var tracker = Instrumentation.DeleteCounter.BeginTiming (metadata, monitor.CancellationToken)) {
+				try {
+					OnDeleteDirectories (localPaths, force, monitor, keepLocal);
+				} catch (Exception e) {
+					LoggingService.LogError ("Failed to delete directory", e);
+					metadata.SetFailure ();
+					if (!keepLocal)
+						foreach (var path in localPaths)
+							Directory.Delete (path, true);
+				}
 			}
 			ClearCachedVersionInfo (localPaths);
 		}
@@ -733,8 +852,16 @@ namespace MonoDevelop.VersionControl
 		// Locks a file in the repository so no other users can change it
 		public void Lock (ProgressMonitor monitor, params FilePath[] localPaths)
 		{
-			ClearCachedVersionInfo (localPaths);
-			OnLock (monitor, localPaths);
+			var metadata = new MultipathOperationMetadata (VersionControlSystem) { PathsCount = localPaths.Length };
+			using (var tracker = Instrumentation.LockCounter.BeginTiming (metadata, monitor.CancellationToken)) {
+				try {
+					ClearCachedVersionInfo (localPaths);
+					OnLock (monitor, localPaths);
+				} catch {
+					metadata.SetFailure ();
+					throw;
+				}
+			}
 		}
 		
 		// Locks a file in the repository so no other users can change it
@@ -746,8 +873,16 @@ namespace MonoDevelop.VersionControl
 		// Unlocks a file in the repository so other users can change it
 		public void Unlock (ProgressMonitor monitor, params FilePath[] localPaths)
 		{
-			ClearCachedVersionInfo (localPaths);
-			OnUnlock (monitor, localPaths);
+			var metadata = new MultipathOperationMetadata (VersionControlSystem) { PathsCount = localPaths.Length };
+			using (var tracker = Instrumentation.UnlockCounter.BeginTiming (metadata, monitor.CancellationToken)) {
+				try {
+					ClearCachedVersionInfo (localPaths);
+					OnUnlock (monitor, localPaths);
+				} catch {
+					metadata.SetFailure ();
+					throw;
+				}
+			}
 		}
 		
 		protected virtual void OnUnlock (ProgressMonitor monitor, params FilePath[] localPaths)
@@ -882,8 +1017,16 @@ namespace MonoDevelop.VersionControl
 		// Ignores a file for version control operations.
 		public void Ignore (FilePath[] localPath)
 		{
-			ClearCachedVersionInfo (localPath);
-			OnIgnore (localPath);
+			var metadata = new MultipathOperationMetadata (VersionControlSystem) { PathsCount = localPath.Length };
+			using (var tracker = Instrumentation.IgnoreCounter.BeginTiming (metadata)) {
+				try {
+					ClearCachedVersionInfo (localPath);
+					OnIgnore (localPath);
+				} catch {
+					metadata.SetFailure ();
+					throw;
+				}
+			}
 		}
 
 		protected abstract void OnIgnore (FilePath[] localPath);
@@ -891,8 +1034,16 @@ namespace MonoDevelop.VersionControl
 		// Unignores a file for version control operations.
 		public void Unignore (FilePath[] localPath)
 		{
-			ClearCachedVersionInfo (localPath);
-			OnUnignore (localPath);
+			var metadata = new MultipathOperationMetadata (VersionControlSystem) { PathsCount = localPath.Length };
+			using (var tracker = Instrumentation.UnignoreCounter.BeginTiming (metadata)) {
+				try {
+					ClearCachedVersionInfo (localPath);
+					OnUnignore (localPath);
+				} catch {
+					metadata.SetFailure ();
+					throw;
+				}
+			}
 		}
 
 		protected abstract void OnUnignore (FilePath[] localPath);

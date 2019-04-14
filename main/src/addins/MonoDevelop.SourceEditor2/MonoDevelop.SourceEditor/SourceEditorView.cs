@@ -66,7 +66,7 @@ using System.Collections.Immutable;
 namespace MonoDevelop.SourceEditor
 {
 	partial class SourceEditorView : ViewContent, IBookmarkBuffer, IClipboardHandler, ITextFile,
-		ICompletionWidget2,  ISplittable, IFoldable, IToolboxDynamicProvider,
+		ICompletionWidget2,  ISplittable, IFoldable, IToolboxDynamicProvider, IToolboxDynamicProviderDeleteSupport,
 		ICustomFilteringToolboxConsumer, IZoomable, ITextEditorResolver, ITextEditorDataProvider,
 		ICodeTemplateHandler, ICodeTemplateContextProvider, IPrintable,
 	ITextEditorImpl, ITextMarkerFactory, IUndoHandler
@@ -1487,8 +1487,9 @@ namespace MonoDevelop.SourceEditor
 			} else if (args.Button == 1) {
 				if (!string.IsNullOrEmpty (Document.FileName)) {
 					if (args.LineSegment != null) {
-						int column = TextEditor.Caret.Line == args.LineNumber ? TextEditor.Caret.Column : 1;
-
+						int column = TextEditor.Caret.Line == args.LineNumber ? 
+												Math.Min (TextEditor.Caret.Column, args.LineSegment.Length) : 1;
+							
 						lock (breakpoints)
 							breakpoints.Toggle (Document.FileName, args.LineNumber, column);
 					}
@@ -3091,14 +3092,20 @@ namespace MonoDevelop.SourceEditor
 
 		string ITextEditorImpl.GetMarkup (int offset, int length, MarkupOptions options)
 		{
+			return GetMarkupAsync (offset, length, options, default).WaitAndGetResult (default);
+		}
+
+		public async Task<string> GetMarkupAsync (int offset, int length, MarkupOptions options, CancellationToken cancellationToken = default)
+		{
+			Runtime.AssertMainThread ();
 			var data = TextEditor.GetTextEditorData ();
 			switch (options.MarkupFormat) {
 			case MarkupFormat.Pango:
-				return data.GetMarkup (offset, length, false, replaceTabs: false, fitIdeStyle: options.FitIdeStyle);
+				return await data.GetMarkupAsync (offset, length, false, replaceTabs: false, fitIdeStyle: options.FitIdeStyle, cancellationToken: cancellationToken);
 			case MarkupFormat.Html:
-				return HtmlWriter.GenerateHtml (ClipboardColoredText.GetChunks (data, new TextSegment (offset, length)).WaitAndGetResult (default (System.Threading.CancellationToken)), data.ColorStyle, data.Options);
+				return HtmlWriter.GenerateHtml (await ClipboardColoredText.GetChunks (data, new TextSegment (offset, length), cancellationToken), data.ColorStyle, data.Options);
 			case MarkupFormat.RichText:
-				return RtfWriter.GenerateRtf (ClipboardColoredText.GetChunks (data, new TextSegment (offset, length)).WaitAndGetResult (default (System.Threading.CancellationToken)), data.ColorStyle, data.Options);
+				return RtfWriter.GenerateRtf (await ClipboardColoredText.GetChunks (data, new TextSegment (offset, length), cancellationToken), data.ColorStyle, data.Options);
 			default:
 				throw new ArgumentOutOfRangeException ();
 			}
@@ -3392,6 +3399,10 @@ namespace MonoDevelop.SourceEditor
 		{
 			return TextEditor.GetLineHeight (line);
 		}
+
+		public bool DeleteDynamicItem (ItemToolboxNode node) => ClipboardRingService.DeleteItem (node);
+
+		public bool CanDeleteDynamicItem (ItemToolboxNode node) => ClipboardRingService.GetToolboxItems ().Contains (node);
 
 		public bool HasFocus {
 			get {

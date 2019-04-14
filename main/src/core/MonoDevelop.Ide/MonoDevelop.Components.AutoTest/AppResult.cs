@@ -32,10 +32,11 @@ using System.Linq;
 using System.Collections.ObjectModel;
 using MonoDevelop.Components.AutoTest.Results;
 using MonoDevelop.Core;
+using System.Runtime.Remoting;
 
 namespace MonoDevelop.Components.AutoTest
 {
-	public abstract class AppResult : MarshalByRefObject
+	public abstract class AppResult : MarshalByRefObject, IDisposable
 	{
 		//public Gtk.Widget ResultWidget { get; private set; }
 
@@ -229,5 +230,22 @@ namespace MonoDevelop.Components.AutoTest
 				return haystack != null && (haystack.IndexOf (needle, StringComparison.Ordinal) > -1);
 			}
 		}
+
+		public void Dispose ()
+		{
+			Dispose (true);
+		}
+
+		protected virtual void Dispose (bool disposing)
+		{
+			RemotingServices.Disconnect (this);
+
+			FirstChild?.Dispose ();
+			NextSibling?.Dispose ();
+
+			FirstChild = NextSibling = ParentNode = PreviousSibling = null;
+		}
+
+		public override object InitializeLifetimeService () => null;
 	}
 }

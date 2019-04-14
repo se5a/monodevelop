@@ -66,6 +66,7 @@ namespace MonoDevelop.Ide
 		Socket listen_socket   = null;
 		List<AddinError> errorsList = new List<AddinError> ();
 		bool initialized;
+		static StartupInfo startupInfo;
 		static readonly int ipcBasePort = 40000;
 		static Stopwatch startupTimer = new Stopwatch ();
 		static Stopwatch startupSectionTimer = new Stopwatch ();
@@ -184,7 +185,7 @@ namespace MonoDevelop.Ide
 
 			AddinManager.AddinLoadError += OnAddinError;
 
-			var startupInfo = new StartupInfo (args);
+			startupInfo = new StartupInfo (args);
 
 			// If a combine was specified, force --newwindow.
 
@@ -280,7 +281,7 @@ namespace MonoDevelop.Ide
 				// XBC #33699
 				Counters.Initialization.Trace ("Initializing IdeApp");
 
-				hideWelcomePage = startupInfo.HasFiles;
+				hideWelcomePage = options.NoStartWindow || startupInfo.HasFiles || IdeApp.Preferences.StartupBehaviour.Value != OnStartupBehaviour.ShowStartWindow;
 				IdeApp.Initialize (monitor, hideWelcomePage);
 				sectionTimings ["AppInitialization"] = startupSectionTimer.ElapsedMilliseconds;
 				startupSectionTimer.Restart ();
@@ -301,7 +302,7 @@ namespace MonoDevelop.Ide
 
 				// load previous combine
 				RecentFile openedProject = null;
-				if (IdeApp.Preferences.LoadPrevSolutionOnStartup && !startupInfo.HasSolutionFile && !IdeApp.Workspace.WorkspaceItemIsOpening && !IdeApp.Workspace.IsOpen) {
+				if (IdeApp.Preferences.StartupBehaviour.Value == OnStartupBehaviour.LoadPreviousSolution && !startupInfo.HasSolutionFile && !IdeApp.Workspace.WorkspaceItemIsOpening && !IdeApp.Workspace.IsOpen) {
 					openedProject = DesktopService.RecentFiles.MostRecentlyUsedProject;
 					if (openedProject != null) {
 						var metadata = GetOpenWorkspaceOnStartupMetadata ();
@@ -378,17 +379,6 @@ namespace MonoDevelop.Ide
 			startupTimer.Stop ();
 			startupSectionTimer.Stop ();
 
-			// Need to start this timer because we don't know yet if we've been asked to open a solution from the file manager.
-			timeToCodeTimer.Start ();
-			ttcMetadata = new TimeToCodeMetadata {
-				StartupTime = startupTimer.ElapsedMilliseconds
-			};
-
-			// Start this timer to limit the time to decide if the app was opened by a file manager
-			IdeApp.StartFMOpenTimer (FMOpenTimerExpired);
-			IdeApp.Workspace.FirstWorkspaceItemOpened += CompleteSolutionTimeToCode;
-			IdeApp.Workbench.DocumentOpened += CompleteFileTimeToCode;
-
 			CreateStartupMetadata (startupInfo, sectionTimings);
 
 			GLib.Idle.Add (OnIdle);
@@ -409,17 +399,6 @@ namespace MonoDevelop.Ide
 			MonoDevelop.Components.GtkWorkarounds.Terminate ();
 			
 			return 0;
-		}
-
-		void FMOpenTimerExpired ()
-		{
-			IdeApp.Workspace.FirstWorkspaceItemOpened -= CompleteSolutionTimeToCode;
-			IdeApp.Workbench.DocumentOpened -= CompleteFileTimeToCode;
-
-			timeToCodeTimer.Stop ();
-			timeToCodeTimer = null;
-
-			ttcMetadata = null;
 		}
 
 		/// <summary>
@@ -469,64 +448,24 @@ namespace MonoDevelop.Ide
 				WelcomePage.WelcomePageService.ShowWelcomePage ();
 				Counters.Initialization.Trace ("Showed welcome page");
 				IdeApp.Workbench.Show ();
+			} else if (hideWelcomePage && !startupInfo.OpenedFiles) {
+				IdeApp.Workbench.Show ();
 			}
 
 			return false;
 		}
 
-		void CreateStartupMetadata (StartupInfo startupInfo, Dictionary<string, long> timings)
+		void CreateStartupMetadata (StartupInfo si, Dictionary<string, long> timings)
 		{
 			var result = DesktopService.PlatformTelemetry;
 			if (result == null) {
 				return;
 			}
 
-			var startupMetadata = GetStartupMetadata (startupInfo, result, timings);
+			var startupMetadata = GetStartupMetadata (si, result, timings);
 			Counters.Startup.Inc (startupMetadata);
 
-			if (ttcMetadata != null) {
-				ttcMetadata.AddProperties (startupMetadata);
-			}
-
-			IdeApp.OnStartupCompleted ();
-		}
-
-		enum TimeToCodeFileType
-		{
-			Solution,
-			Document
-		}
-
-		static void CompleteSolutionTimeToCode (object sender, EventArgs args)
-		{
-			CompleteTimeToCode (TimeToCodeMetadata.DocumentType.Solution);
-		}
-
-		static void CompleteFileTimeToCode (object sender, EventArgs args)
-		{
-			CompleteTimeToCode (TimeToCodeMetadata.DocumentType.File);
-		}
-
-		static void CompleteTimeToCode (TimeToCodeMetadata.DocumentType type)
-		{
-			IdeApp.Workspace.FirstWorkspaceItemOpened -= CompleteSolutionTimeToCode;
-			IdeApp.Workbench.DocumentOpened -= CompleteFileTimeToCode;
-
-			if (timeToCodeTimer == null) {
-				return;
-			}
-
-			timeToCodeTimer.Stop ();
-			ttcMetadata.SolutionLoadTime = timeToCodeTimer.ElapsedMilliseconds;
-
-			ttcMetadata.CorrectedDuration = ttcMetadata.StartupTime + ttcMetadata.SolutionLoadTime;
-			ttcMetadata.Type = type;
-
-			if (IdeApp.ReportTimeToCode) {
-				Counters.TimeToCode.Inc ("SolutionLoaded", ttcMetadata);
-				IdeApp.ReportTimeToCode = false;
-			}
-			timeToCodeTimer = null;
+			IdeApp.OnStartupCompleted (startupMetadata, timeToCodeTimer);
 		}
 
 		static DateTime lastIdle;
@@ -812,6 +751,7 @@ namespace MonoDevelop.Ide
 			// set as a metadata property on the Counters.Startup counter.
 			startupTimer.Start ();
 			startupSectionTimer.Start ();
+			timeToCodeTimer.Start ();
 
 			var options = MonoDevelopOptions.Parse (args);
 			if (options.ShowHelp || options.Error != null)
@@ -919,7 +859,8 @@ namespace MonoDevelop.Ide
 				IsInitialRunAfterUpgrade = IdeApp.IsInitialRunAfterUpgrade,
 				TimeSinceMachineStart = (long)platformDetails.TimeSinceMachineStart.TotalMilliseconds,
 				TimeSinceLogin = (long)platformDetails.TimeSinceLogin.TotalMilliseconds,
-				Timings = timings
+				Timings = timings,
+				StartupBehaviour = IdeApp.Preferences.StartupBehaviour.Value
 			};
 		}
 
@@ -944,6 +885,7 @@ namespace MonoDevelop.Ide
 		{
 			return new Mono.Options.OptionSet {
 				{ "no-splash", "Do not display splash screen (deprecated).", s => {} },
+				{ "no-start-window", "Do not display start window", s => NoStartWindow = true },
 				{ "ipc-tcp", "Use the Tcp channel for inter-process communication.", s => IpcTcp = true },
 				{ "new-window", "Do not open in an existing instance of " + BrandingService.ApplicationName, s => NewWindow = true },
 				{ "h|?|help", "Show help", s => ShowHelp = true },
@@ -980,7 +922,8 @@ namespace MonoDevelop.Ide
 			
 			return opt;
 		}
-		
+
+		public bool NoStartWindow { get; set; }
 		public bool IpcTcp { get; set; }
 		public bool NewWindow { get; set; }
 		public bool ShowHelp { get; set; }

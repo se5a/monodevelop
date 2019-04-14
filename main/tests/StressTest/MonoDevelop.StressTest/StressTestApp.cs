@@ -1,4 +1,4 @@
-﻿//
+//
 // StressTestApp.cs
 //
 // Author:
@@ -37,7 +37,9 @@ namespace MonoDevelop.StressTest
 	{
 		List<string> FoldersToClean = new List<string> ();
 		ITestScenario scenario;
-		StressTestOptions.ProfilerOptions ProfilerOptions;
+		ProfilerOptions ProfilerOptions;
+
+		LeakProcessor leakProcessor;
 
 		public StressTestApp (StressTestOptions options)
 		{
@@ -50,43 +52,66 @@ namespace MonoDevelop.StressTest
 			if (options.UseInstalledApplication) {
 				MonoDevelopBinPath = GetInstalledVisualStudioBinPath ();
 			}
+
+			provider = options.Provider;
 		}
 
 		public string MonoDevelopBinPath { get; set; }
 		public int Iterations { get; set; } = 1;
+		readonly ITestScenarioProvider provider;
 		ProfilerProcessor profilerProcessor;
+
+		const int setupIteration = -1;
+		const int cleanupIteration = int.MinValue;
 
 		public void Start ()
 		{
 			ValidateMonoDevelopBinPath ();
-			SetupIdeLogFolder ();
+			var logFile = SetupIdeLogFolder ();
 
 			string profilePath = Util.CreateTmpDir ();
 
 			FoldersToClean.Add (profilePath);
-			if (ProfilerOptions.Type != StressTestOptions.ProfilerOptions.ProfilerType.Disabled) {
-				if (ProfilerOptions.MlpdOutputPath == null)
-					ProfilerOptions.MlpdOutputPath = Path.Combine (profilePath, "profiler.mlpd");
-				profilerProcessor = new ProfilerProcessor (ProfilerOptions);
-				string monoPath = Environment.GetEnvironmentVariable ("PATH")
-											 .Split (Path.PathSeparator)
-											 .Select (p => Path.Combine (p, "mono"))
-											 .FirstOrDefault (s => File.Exists (s));
-				TestService.StartSession (monoPath, profilePath, $"{profilerProcessor.GetMonoArguments ()} \"{MonoDevelopBinPath}\"");
-				Console.WriteLine ($"Profler is logging into {ProfilerOptions.MlpdOutputPath}");
-			} else {
-				TestService.StartSession (MonoDevelopBinPath, profilePath);
-			}
+
+			scenario = provider.GetTestScenario ();
+
+			if (!StartWithProfiler (profilePath, logFile))
+				TestService.StartSession (MonoDevelopBinPath, profilePath, logFile);
+
 			TestService.Session.DebugObject = new UITestDebug ();
 
 			TestService.Session.WaitForElement (IdeQuery.DefaultWorkbench);
 
-			scenario = TestScenarioProvider.GetTestScenario ();
+			leakProcessor = new LeakProcessor (scenario, ProfilerOptions);
 
+			ReportMemoryUsage (setupIteration);
 			for (int i = 0; i < Iterations; ++i) {
 				scenario.Run ();
 				ReportMemoryUsage (i);
 			}
+
+			UserInterfaceTests.Ide.CloseAll (exit: false);
+			ReportMemoryUsage (cleanupIteration);
+		}
+
+		bool StartWithProfiler (string profilePath, string logFile)
+		{
+			if (ProfilerOptions.Type == ProfilerOptions.ProfilerType.Disabled)
+				return false;
+
+			if (ProfilerOptions.MlpdOutputPath == null)
+				ProfilerOptions.MlpdOutputPath = Path.Combine (profilePath, "profiler.mlpd");
+			if (File.Exists (ProfilerOptions.MlpdOutputPath))
+				File.Delete (ProfilerOptions.MlpdOutputPath);
+			profilerProcessor = new ProfilerProcessor (scenario, ProfilerOptions);
+			string monoPath = Environment.GetEnvironmentVariable ("PATH")
+										 .Split (Path.PathSeparator)
+										 .Select (p => Path.Combine (p, "mono"))
+										 .FirstOrDefault (s => File.Exists (s));
+
+			TestService.StartSession (monoPath, profilePath, logFile, $"{profilerProcessor.GetMonoArguments ()} \"{MonoDevelopBinPath}\"");
+			Console.WriteLine ($"Profler is logging into {ProfilerOptions.MlpdOutputPath}");
+			return true;
 		}
 
 		public void Stop ()
@@ -94,6 +119,8 @@ namespace MonoDevelop.StressTest
 			UserInterfaceTests.Ide.CloseAll ();
 			TestService.EndSession ();
 			OnCleanUp ();
+
+			leakProcessor.ReportResult ();
 		}
 
 		void ValidateMonoDevelopBinPath ()
@@ -124,17 +151,14 @@ namespace MonoDevelop.StressTest
 			return "/Applications/Visual Studio.app/Contents/Resources/lib/monodevelop/bin/VisualStudio.exe";
 		}
 
-		void SetupIdeLogFolder ()
+		string SetupIdeLogFolder ()
 		{
 			string rootDirectory = Path.GetDirectoryName (GetType ().Assembly.Location);
 			string ideLogDirectory = Path.Combine (rootDirectory, "Log");
 			Directory.CreateDirectory (ideLogDirectory);
 
-			FoldersToClean.Add (ideLogDirectory);
-
 			string ideLogFileName = Path.Combine (ideLogDirectory, "StressTest.log");
-			Environment.SetEnvironmentVariable ("MONODEVELOP_LOG_FILE", ideLogFileName);
-			Environment.SetEnvironmentVariable ("MONODEVELOP_FILE_LOG_LEVEL", "UpToInfo");
+			return ideLogFileName;
 		}
 
 		void OnCleanUp ()
@@ -155,14 +179,28 @@ namespace MonoDevelop.StressTest
 
 		void ReportMemoryUsage (int iteration)
 		{
-			UserInterfaceTests.Ide.WaitForIdeIdle ();//Make sure IDE stops doing what it was doing
+			//Make sure IDE stops doing what it was doing
+			UserInterfaceTests.Ide.WaitForIdeIdle ();
+
+			// This is to prevent leaking of AppQuery instances.
+			TestService.Session.DisconnectQueries ();
+			Heapshot heapshot = null;
 			if (profilerProcessor != null) {
-				profilerProcessor.TakeHeapshotAndMakeReport ().Wait ();
+				heapshot = profilerProcessor.TakeHeapshotAndMakeReport ().Result;
 			}
 
 			var memoryStats = TestService.Session.MemoryStats;
 
-			Console.WriteLine ("Run {0}", iteration + 1);
+			string iterationName;
+			if (iteration == cleanupIteration) {
+				iterationName = "Cleanup";
+			} else if (iteration == setupIteration) {
+				iterationName = "Setup";
+			} else {
+				iterationName = string.Format ("Run_{0}", iteration + 1);
+			}
+
+			Console.WriteLine (iterationName);
 
 			Console.WriteLine ("  NonPagedSystemMemory: " + memoryStats.NonPagedSystemMemory);
 			Console.WriteLine ("  PagedMemory: " + memoryStats.PagedMemory);
@@ -173,6 +211,8 @@ namespace MonoDevelop.StressTest
 			Console.WriteLine ("  WorkingSet: " + memoryStats.WorkingSet);
 
 			Console.WriteLine ();
+
+			leakProcessor.Process (heapshot, iteration == cleanupIteration, iterationName, memoryStats);
 		}
 	}
 }

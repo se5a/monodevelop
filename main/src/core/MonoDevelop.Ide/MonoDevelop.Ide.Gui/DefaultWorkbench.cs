@@ -79,6 +79,7 @@ namespace MonoDevelop.Ide.Gui
 		IWorkbenchWindow lastActive;
 
 		bool closeAll;
+		bool? fullScreenState = null;
 
 		Rectangle normalBounds = new Rectangle(0, 0, MinimumWidth, MinimumHeight);
 		
@@ -146,13 +147,20 @@ namespace MonoDevelop.Ide.Gui
 		public DockFrame DockFrame {
 			get { return dock; }
 		}
-		
+
 		public bool FullScreen {
 			get {
 				return DesktopService.GetIsFullscreen (this);
 			}
 			set {
-				DesktopService.SetIsFullscreen (this, value);
+				// If this window is not visible, don't set full screen mode
+				// until it is, as that would conflict with other windows we
+				// might be opening before (Start Window, for instance)
+				if (Visible) {
+					DesktopService.SetIsFullscreen (this, value);
+				} else {
+					fullScreenState = value;
+				}
 			}
 		}
 
@@ -427,7 +435,7 @@ namespace MonoDevelop.Ide.Gui
 			} else
 				type = "(not a file)";
 
-			var metadata = new Dictionary<string,string> () {
+			var metadata = new Dictionary<string,object> () {
 				{ "FileType", type },
 				{ "DisplayBinding", content.GetType ().FullName },
 			};
@@ -435,7 +443,7 @@ namespace MonoDevelop.Ide.Gui
 			if (isFile)
 				metadata ["DisplayBindingAndType"] = type + " | " + content.GetType ().FullName;
 
-			Counters.DocumentOpened.Inc (metadata);
+			Counters.DocumentOpened.Inc (1, null, metadata);
 
 			var mimeimage = PrepareShowView (content);
 			var addToControl = notebook ?? DockNotebook.ActiveNotebook ?? tabControl;
@@ -688,38 +696,45 @@ namespace MonoDevelop.Ide.Gui
 		{
 			foreach (var e in args) {
 				if (e.IsDirectory) {
-					var views = new ViewContent [viewContentCollection.Count];
-					viewContentCollection.CopyTo (views, 0);
-					foreach (var content in views) {
-						if (content.ContentName.StartsWith (e.FileName, StringComparison.CurrentCulture)) {
-							if (content.IsDirty) {
-								content.UntitledName = content.ContentName;
-								content.ContentName = null;
-							} else {
-								((SdiWorkspaceWindow)content.WorkbenchWindow).CloseWindow (true, true).Ignore();
-							}
-						}
-					}
+					CheckRemovedDirectory (e.FileName);
 				} else {
 					foreach (var content in viewContentCollection) {
 						if (content.ContentName != null &&
 							content.ContentName == e.FileName) {
-							if (content.IsDirty) {
-								content.UntitledName = content.ContentName;
-								content.ContentName = null;
-							} else {
-								((SdiWorkspaceWindow)content.WorkbenchWindow).CloseWindow (true, true).Ignore();
-							}
+							CloseViewForRemovedFile (content);
 							return;
 						}
 					}
+					CheckRemovedDirectory (e.FileName);
 				}
 			}
 		}
-		
+
+		void CheckRemovedDirectory (FilePath fileName)
+		{
+			var views = new ViewContent [viewContentCollection.Count];
+			viewContentCollection.CopyTo (views, 0);
+			foreach (var content in views) {
+				if (content.ContentName != null &&
+					((FilePath)content.ContentName).IsChildPathOf (fileName)) {
+					CloseViewForRemovedFile (content);
+				}
+			}
+		}
+
+		static void CloseViewForRemovedFile (ViewContent content)
+		{
+			if (content.IsDirty) {
+				content.UntitledName = content.ContentName;
+				content.ContentName = null;
+			} else {
+				((SdiWorkspaceWindow)content.WorkbenchWindow).CloseWindow (true, true).Ignore ();
+			}
+		}
+
 		void CheckRenamedFile(object sender, FileCopyEventArgs args)
 		{
-			foreach (FileCopyEventInfo e in args) {
+			foreach (FileEventInfo e in args) {
 				if (e.IsDirectory) {
 					foreach (ViewContent content in viewContentCollection) {
 						if (content.ContentName != null && ((FilePath)content.ContentName).IsChildPathOf (e.SourceFile)) {
@@ -730,11 +745,25 @@ namespace MonoDevelop.Ide.Gui
 					foreach (ViewContent content in viewContentCollection) {
 						if (content.ContentName != null &&
 						    content.ContentName == e.SourceFile) {
-							content.ContentName = e.TargetFile;
+
+							// In case of a File.Replace, on Windows, the OS will rename this file to a temporary file.
+							// By the time the thaw is done, the temporary file is gone, so don't bother relocating.
+							if (File.Exists (e.TargetFile)) {
+								content.ContentName = e.TargetFile;
+							}
 							return;
 						}
 					}
 				}
+			}
+		}
+
+		protected override void OnShown ()
+		{
+			base.OnShown ();
+			if (fullScreenState != null && fullScreenState != DesktopService.GetIsFullscreen (this)) {
+				DesktopService.SetIsFullscreen (this, (bool) fullScreenState);
+				fullScreenState = null;
 			}
 		}
 

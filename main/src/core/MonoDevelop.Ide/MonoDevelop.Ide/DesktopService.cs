@@ -132,13 +132,6 @@ namespace MonoDevelop.Ide
 			get { return PlatformService.Name; }
 		}
 
-		[Obsolete]
-		public static string DefaultControlLeftRightBehavior {
-			get {
-				return PlatformService.DefaultControlLeftRightBehavior;
-			}
-		}
-
 		public static void ShowUrl (string url)
 		{
 			PlatformService.ShowUrl (url);
@@ -321,7 +314,7 @@ namespace MonoDevelop.Ide
 			if (args.IsExternal)
 				return;
 
-			foreach (FileCopyEventInfo e in args) {
+			foreach (FileEventInfo e in args) {
 				if (!e.IsDirectory) {
 					PlatformService.RecentFiles.NotifyFileRenamed (e.SourceFile, e.TargetFile);
 				}
@@ -349,6 +342,16 @@ namespace MonoDevelop.Ide
 		internal static void GrabDesktopFocus (Gtk.Window window)
 		{
 			PlatformService.GrabDesktopFocus (window);
+		}
+
+		public static Window GetParentForModalWindow ()
+		{
+			return PlatformService.GetParentForModalWindow ();
+		}
+
+		public static Window GetFocusedTopLevelWindow ()
+		{
+			return PlatformService.GetFocusedTopLevelWindow ();
 		}
 
 		public static void FocusWindow (Window window)

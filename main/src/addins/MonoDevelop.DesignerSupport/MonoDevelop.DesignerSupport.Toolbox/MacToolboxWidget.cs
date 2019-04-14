@@ -56,7 +56,6 @@ namespace MonoDevelop.DesignerSupport.Toolbox
 		public event EventHandler Focused;
 		public event EventHandler DragBegin;
 		public event EventHandler<CGPoint> MenuOpened;
-		public event EventHandler SelectedItemChanged;
 		public event EventHandler ActivateSelectedItem;
 		public Action<NSEvent> MouseDownActivated { get; set; }
 
@@ -74,8 +73,6 @@ namespace MonoDevelop.DesignerSupport.Toolbox
 		internal void PerformActivateSelectedItem () => OnActivateSelectedItem (EventArgs.Empty);
 
 		void OnActivateSelectedItem (EventArgs args) => ActivateSelectedItem?.Invoke (this, args);
-	
-		void OnSelectedItemChanged (EventArgs args) => SelectedItemChanged?.Invoke (this, args);
 
 		NSIndexPath selectedIndexPath;
 		public NSIndexPath SelectedIndexPath {
@@ -85,7 +82,6 @@ namespace MonoDevelop.DesignerSupport.Toolbox
 			set {
 				if (selectedIndexPath != value) {
 					selectedIndexPath = value;
-					OnSelectedItemChanged (EventArgs.Empty);
 				}
 			}
 		}
@@ -255,6 +251,7 @@ namespace MonoDevelop.DesignerSupport.Toolbox
 			base.SetFrameSize (newSize);
 			var frame = messageTextField.Frame;
 			messageTextField.Frame = new CGRect (frame.Location, newSize);
+			RedrawItems (true, false);
 		}
 
 		public override void MouseDown (NSEvent theEvent)
@@ -344,12 +341,6 @@ namespace MonoDevelop.DesignerSupport.Toolbox
 			RegisterClassForItem (typeof (HeaderCollectionViewItem), HeaderViewItemName);
 			RegisterClassForItem (typeof (LabelCollectionViewItem), LabelViewItemName);
 			RegisterClassForItem (typeof (ImageCollectionViewItem), ImageViewItemName);
-
-			NSNotificationCenter.DefaultCenter.AddObserver (FrameChangedNotification, (s => {
-				if (s.Object == this) {
-					RedrawItems (true, false);
-				}
-			}));
 		}
 
 		protected override void Dispose (bool disposing)

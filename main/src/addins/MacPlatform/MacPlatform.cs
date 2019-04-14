@@ -57,6 +57,7 @@ using Xwt.Mac;
 using MonoDevelop.Components.Mac;
 using System.Reflection;
 using MacPlatform;
+using MonoDevelop.Projects;
 
 namespace MonoDevelop.MacIntegration
 {
@@ -266,6 +267,7 @@ namespace MonoDevelop.MacIntegration
 						e.Reply = NSApplicationTerminateReply.Now;
 					}
 				};
+				appDelegate.ShowDockMenu += AppDelegate_ShowDockMenu;
 			}
 
 			// Listen to the AtkCocoa notification for the presence of VoiceOver
@@ -297,6 +299,27 @@ namespace MonoDevelop.MacIntegration
 
 			return loaded;
 		}
+
+		void AppDelegate_ShowDockMenu (object sender, ShowDockMenuArgs e)
+		{
+			if (((FilePath)NSBundle.MainBundle.BundlePath).Extension != ".app")
+				return;
+			var menu = new NSMenu ();
+			var newInstanceMenuItem = new NSMenuItem ();
+			newInstanceMenuItem.Title = GettextCatalog.GetString ("New Instance");
+			newInstanceMenuItem.Activated += NewInstanceMenuItem_Activated;
+			menu.AddItem (newInstanceMenuItem);
+			e.DockMenu = menu;
+		}
+
+		static void NewInstanceMenuItem_Activated (object sender, EventArgs e)
+		{
+			var bundlePath = NSBundle.MainBundle.BundlePath;
+			NSWorkspace.SharedWorkspace.LaunchApplication (NSUrl.FromFilename (bundlePath), NSWorkspaceLaunchOptions.NewInstance, new NSDictionary (), out NSError error);
+			if (error != null)
+				LoggingService.LogError ($"Failed to start new instance: {error.LocalizedDescription}");
+		}
+
 
 		const string EnabledKey = "com.monodevelop.AccessibilityEnabled";
 		static void ShowVoiceOverNotice ()
@@ -560,6 +583,14 @@ namespace MonoDevelop.MacIntegration
 //			Gtk.Rc.ParseString (gtkrc);
 		}
 
+		static TimeToCodeMetadata.DocumentType GetDocumentTypeFromFilename (string filename)
+		{
+			if (Projects.Services.ProjectService.IsWorkspaceItemFile (filename) || Projects.Services.ProjectService.IsSolutionItemFile (filename)) {
+				return TimeToCodeMetadata.DocumentType.Solution;
+			}
+			return TimeToCodeMetadata.DocumentType.File;
+		}
+
 		void GlobalSetup ()
 		{
 			//FIXME: should we remove these when finalizing?
@@ -606,21 +637,30 @@ namespace MonoDevelop.MacIntegration
 				};
 
 				ApplicationEvents.OpenDocuments += delegate (object sender, ApplicationDocumentEventArgs e) {
-					//OpenFiles may pump the mainloop, but can't do that from an AppleEvent, so use a brief timeout
-					GLib.Timeout.Add (0, delegate {
+					//OpenFiles may pump the mainloop, but can't do that from an AppleEvent
+					GLib.Idle.Add (delegate {
 						Ide.WelcomePage.WelcomePageService.HideWelcomePageOrWindow ();
-						IdeApp.ReportTimeToCode = true;
+						var trackTTC = IdeApp.StartTimeToCodeLoadTimer ();
 						IdeApp.OpenFiles (e.Documents.Select (
-							doc => new FileOpenInformation (doc.Key, null, doc.Value, 1, OpenDocumentOptions.DefaultInternal))
-						);
+							doc => new FileOpenInformation (doc.Key, null, doc.Value, 1, OpenDocumentOptions.DefaultInternal)),
+							null
+						).ContinueWith ((result) => {
+							if (!trackTTC) {
+								return;
+							}
+
+							var firstFile = e.Documents.First ().Key;
+
+							IdeApp.TrackTimeToCode (GetDocumentTypeFromFilename (firstFile));
+						});
 						return false;
 					});
 					e.Handled = true;
 				};
 
 				ApplicationEvents.OpenUrls += delegate (object sender, ApplicationUrlEventArgs e) {
-					GLib.Timeout.Add (0, delegate {
-						IdeApp.ReportTimeToCode = true;
+					GLib.Idle.Add (delegate {
+						var trackTTC = IdeApp.StartTimeToCodeLoadTimer ();
 						// Open files via the monodevelop:// URI scheme, compatible with the
 						// common TextMate scheme: http://blog.macromates.com/2007/the-textmate-url-scheme/
 						IdeApp.OpenFiles (e.Urls.Select (url => {
@@ -644,7 +684,14 @@ namespace MonoDevelop.MacIntegration
 								LoggingService.LogError ("Invalid TextMate URI: " + url, ex);
 								return null;
 							}
-						}).Where (foi => foi != null));
+						}).Where (foi => foi != null), null).ContinueWith ((result) => {
+							if (!trackTTC) {
+								return;
+							}
+							var firstFile = e.Urls.First ();
+
+							IdeApp.TrackTimeToCode (GetDocumentTypeFromFilename (firstFile));
+						});
 						return false;
 					});
 				};
@@ -944,6 +991,16 @@ namespace MonoDevelop.MacIntegration
 		{
 			window.Present ();
 			NSApplication.SharedApplication.ActivateIgnoringOtherApps (true);
+		}
+
+		public override Window GetParentForModalWindow ()
+		{
+			return NSApplication.SharedApplication.ModalWindow ?? NSApplication.SharedApplication.KeyWindow ?? NSApplication.SharedApplication.MainWindow;
+		}
+
+		public override Window GetFocusedTopLevelWindow ()
+		{
+			return NSApplication.SharedApplication.KeyWindow;
 		}
 
 		public override void FocusWindow (Window window)
@@ -1337,6 +1394,14 @@ namespace MonoDevelop.MacIntegration
 
 	public class ThemedMacDialogBackend : Xwt.Mac.DialogBackend
 	{
+		public ThemedMacDialogBackend ()
+		{
+		}
+
+		public ThemedMacDialogBackend (IntPtr ptr) : base (ptr)
+		{
+		}
+
 		public override void InitializeBackend (object frontend, Xwt.Backends.ApplicationContext context)
 		{
 			base.InitializeBackend (frontend, context);
@@ -1346,6 +1411,14 @@ namespace MonoDevelop.MacIntegration
 
 	public class ThemedMacAlertDialogBackend : Xwt.Mac.AlertDialogBackend
 	{
+		public ThemedMacAlertDialogBackend ()
+		{
+		}
+
+		public ThemedMacAlertDialogBackend (IntPtr ptr) : base (ptr)
+		{
+		}
+
 		public override void Initialize (Xwt.Backends.ApplicationContext actx)
 		{
 			base.Initialize (actx);

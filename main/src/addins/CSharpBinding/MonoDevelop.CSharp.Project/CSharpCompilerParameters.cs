@@ -144,6 +144,8 @@ namespace MonoDevelop.CSharp.Project
 				cryptoKeyFile: ParentConfiguration.SignAssembly ? ParentConfiguration.AssemblyKeyFile : null,
 				cryptoPublicKey: ImmutableArray<byte>.Empty,
 				platform: GetPlatform (),
+				publicSign: ParentConfiguration.PublicSign,
+				delaySign: ParentConfiguration.DelaySign,
 				generalDiagnosticOption: TreatWarningsAsErrors ? ReportDiagnostic.Error : ReportDiagnostic.Default,
 				warningLevel: WarningLevel,
 				specificDiagnosticOptions: GetSpecificDiagnosticOptions (),
@@ -186,11 +188,10 @@ namespace MonoDevelop.CSharp.Project
 			var items = warnings.Split (new [] { ';', ',' }, StringSplitOptions.RemoveEmptyEntries).Distinct ();
 
 			foreach (string warning in items) {
-				if (warning.StartsWith ("CS", StringComparison.OrdinalIgnoreCase)) {
-					yield return warning;
-				} else {
+				if (int.TryParse (warning, out _))
 					yield return "CS" + warning;
-				}
+				else
+					yield return warning;
 			}
 		}
 

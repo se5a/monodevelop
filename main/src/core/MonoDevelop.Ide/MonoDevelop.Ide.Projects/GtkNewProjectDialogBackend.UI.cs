@@ -106,12 +106,6 @@ namespace MonoDevelop.Ide.Projects
 
 			Name = "wizard_dialog";
 			Title = GettextCatalog.GetString ("New Project");
-			if (IdeApp.Workbench.RootWindow.Visible) {
-				WindowPosition = WindowPosition.CenterOnParent;
-				TransientFor = IdeApp.Workbench.RootWindow;
-			} else
-				// FIXME: align on a native toplevel if available
-				WindowPosition = WindowPosition.Center;
 
 			projectConfigurationWidget = new GtkProjectConfigurationWidget ();
 			projectConfigurationWidget.Name = "projectConfigurationWidget";
@@ -321,8 +315,6 @@ namespace MonoDevelop.Ide.Projects
 			if (Child != null) {
 				Child.ShowAll ();
 			}
-
-			Show ();
 
 			templatesTreeView.HasFocus = true;
 			Resizable = false;

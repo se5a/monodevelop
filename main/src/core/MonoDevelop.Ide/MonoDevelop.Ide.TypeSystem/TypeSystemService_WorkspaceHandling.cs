@@ -150,10 +150,18 @@ namespace MonoDevelop.Ide.TypeSystem
 				if (showStatusIcon)
 					workspace.ShowStatusIcon ();
 
-				await workspace.TryLoadSolution (cancellationToken).ConfigureAwait (false);
-				TaskCompletionSource<MonoDevelopWorkspace> request;
-				if (workspaceRequests.TryGetValue (workspace.MonoDevelopSolution, out request))
-					request.TrySetResult (workspace);
+				var (solution, solutionInfo) = await workspace.TryLoadSolution (cancellationToken).ConfigureAwait (false);
+
+				if (workspaceRequests.TryGetValue (solution, out var request)) {
+					if (solutionInfo == null) {
+						// Check for solutionInfo == null rather than cancellation was requested, as cancellation does not happen
+						// after all project infos are loaded.
+						request.TrySetCanceled ();
+					} else {
+						request.TrySetResult (workspace);
+					}
+				}
+
 				if (showStatusIcon)
 					workspace.HideStatusIcon ();
 
@@ -176,6 +184,11 @@ namespace MonoDevelop.Ide.TypeSystem
 					if (result != emptyWorkspace) {
 						lock (workspaceLock)
 							workspaces = workspaces.Remove (result);
+
+						if (workspaceRequests.TryGetValue (solution, out var request)) {
+							request.TrySetCanceled ();
+						}
+
 						result.Dispose ();
 					}
 					solution.SolutionItemAdded -= OnSolutionItemAdded;
@@ -270,14 +283,16 @@ namespace MonoDevelop.Ide.TypeSystem
 			//We assume that since we have projectId and project is not found in solution
 			//project is being loaded(waiting MSBuild to return list of source files)
 			var taskSource = new TaskCompletionSource<Microsoft.CodeAnalysis.Project> ();
+			var registration = cancellationToken.Register (() => taskSource.TrySetCanceled ());
 			EventHandler<WorkspaceChangeEventArgs> del = (s, e) => {
 				if (e.Kind == WorkspaceChangeKind.SolutionAdded || e.Kind == WorkspaceChangeKind.SolutionReloaded) {
 					proj = workspace.CurrentSolution.GetProject (projectId);
-					if (proj != null)
-						taskSource.SetResult (proj);
+					if (proj != null) {
+						registration.Dispose ();
+						taskSource.TrySetResult (proj);
+					}
 				}
 			};
-			cancellationToken.Register (taskSource.SetCanceled);
 			workspace.WorkspaceChanged += del;
 			try {
 				proj = await taskSource.Task;

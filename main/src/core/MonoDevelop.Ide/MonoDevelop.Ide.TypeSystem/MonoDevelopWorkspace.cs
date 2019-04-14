@@ -55,6 +55,7 @@ using Microsoft.CodeAnalysis.SolutionCrawler;
 using MonoDevelop.Ide.Composition;
 using MonoDevelop.Ide.RoslynServices;
 using MonoDevelop.Core.Assemblies;
+using System.Runtime.CompilerServices;
 
 namespace MonoDevelop.Ide.TypeSystem
 {
@@ -72,7 +73,8 @@ namespace MonoDevelop.Ide.TypeSystem
 
 		CancellationTokenSource src = new CancellationTokenSource ();
 		bool disposed;
-		readonly object updatingProjectDataLock = new object ();
+
+		internal readonly SemaphoreSlim LoadLock = new SemaphoreSlim (1, 1);
 		Lazy<MonoDevelopMetadataReferenceManager> manager;
 		Lazy<MetadataReferenceHandler> metadataHandler;
 		ProjectionData Projections { get; }
@@ -80,7 +82,7 @@ namespace MonoDevelop.Ide.TypeSystem
 		ProjectDataMap ProjectMap { get; }
 		ProjectSystemHandler ProjectHandler { get; }
 
-		public MonoDevelop.Projects.Solution MonoDevelopSolution { get; }
+		public MonoDevelop.Projects.Solution MonoDevelopSolution { get; private set; }
 
 		internal MonoDevelopMetadataReferenceManager MetadataReferenceManager => manager.Value;
 		internal static HostServices HostServices => CompositionManager.Instance.HostServices;
@@ -245,28 +247,53 @@ namespace MonoDevelop.Ide.TypeSystem
 
 		protected internal override bool PartialSemanticsEnabled => backgroundCompiler != null;
 
+		// This is called by OnSolutionRemoved and on Dispose.
+		protected override void ClearSolutionData ()
+		{
+			if (MonoDevelopSolution != null) {
+				foreach (var prj in MonoDevelopSolution.GetAllProjects ()) {
+					ProjectMap.RemoveProject (prj);
+					UnloadMonoProject (prj);
+				}
+			}
+
+			base.ClearSolutionData ();
+		}
+
+		// This is called by OnProjectRemoved.
+		protected override void ClearProjectData (ProjectId projectId)
+		{
+			var actualProject = ProjectMap.RemoveProject (projectId);
+			UnloadMonoProject (actualProject);
+
+			base.ClearProjectData (projectId);
+		}
+
 		protected override void Dispose (bool finalize)
 		{
-			base.Dispose (finalize);
 			if (disposed)
 				return;
 
 			disposed = true;
 
+			CancelLoad ();
+
+			var cacheService = Services.GetService<IWorkspaceCacheService> ();
+			if (cacheService != null)
+				cacheService.CacheFlushRequested -= OnCacheFlushRequested;
+
+			var cacheHostService = Services.GetService<IProjectCacheHostService> () as IDisposable;
+			cacheHostService?.Dispose ();
+
+			ProjectHandler.Dispose ();
 			MetadataReferenceManager.ClearCache ();
 
 			IdeApp.Preferences.EnableSourceAnalysis.Changed -= OnEnableSourceAnalysisChanged;
 			IdeApp.Preferences.Roslyn.FullSolutionAnalysisRuntimeEnabledChanged -= OnEnableFullSourceAnalysisChanged;
 			DesktopService.MemoryMonitor.StatusChanged -= OnMemoryStatusChanged;
 
-			CancelLoad ();
 			if (IdeApp.Workspace != null) {
 				IdeApp.Workspace.ActiveConfigurationChanged -= HandleActiveConfigurationChanged;
-			}
-			if (MonoDevelopSolution != null) {
-				foreach (var prj in MonoDevelopSolution.GetAllProjects ()) {
-					UnloadMonoProject (prj);
-				}
 			}
 
 			var solutionCrawler = Services.GetService<ISolutionCrawlerRegistrationService> ();
@@ -276,6 +303,11 @@ namespace MonoDevelop.Ide.TypeSystem
 				backgroundCompiler.Dispose ();
 				backgroundCompiler = null; // PartialSemanticsEnabled will now return false
 			}
+
+			base.Dispose (finalize);
+
+			// Do this at the end so solution removal from base disposal is done properly.
+			MonoDevelopSolution = null;
 		}
 
 		internal void InformDocumentTextChange (DocumentId id, SourceText text)
@@ -313,7 +345,7 @@ namespace MonoDevelop.Ide.TypeSystem
 			var token = src.Token;
 
 			try {
-				var si = await ProjectHandler.CreateSolutionInfo (MonoDevelopSolution, token).ConfigureAwait (false);
+				var (solution, si) = await ProjectHandler.CreateSolutionInfo (MonoDevelopSolution, token).ConfigureAwait (false);
 				if (si != null)
 					OnSolutionReloaded (si);
 			} catch (OperationCanceledException) {
@@ -331,7 +363,7 @@ namespace MonoDevelop.Ide.TypeSystem
 			ProjectHandler.ReloadModifiedProject (project);
 		}
 
-		internal Task<SolutionInfo> TryLoadSolution (CancellationToken cancellationToken = default(CancellationToken))
+		internal Task<(MonoDevelop.Projects.Solution, SolutionInfo)> TryLoadSolution (CancellationToken cancellationToken = default(CancellationToken))
 		{
 			return ProjectHandler.CreateSolutionInfo (MonoDevelopSolution, CancellationTokenSource.CreateLinkedTokenSource (cancellationToken, src.Token).Token);
 		}
@@ -1057,13 +1089,13 @@ namespace MonoDevelop.Ide.TypeSystem
 			return project.GetAdditionalDocument (documentId);
 		}
 
-		internal Task UpdateFileContent (string fileName, string text)
+		internal async Task UpdateFileContent (string fileName, string text)
 		{
 			SourceText newText = SourceText.From (text);
 			var tasks = new List<Task> ();
-			lock (updatingProjectDataLock) {
-				foreach (var kv in ProjectMap.projectDataMap) {
-					var projectId = kv.Key;
+			try {
+				await LoadLock.WaitAsync ();
+				foreach (var projectId in ProjectMap.GetProjectIds ()) {
 					var docId = this.GetDocumentId (projectId, fileName);
 					if (docId != null) {
 						try {
@@ -1089,22 +1121,17 @@ namespace MonoDevelop.Ide.TypeSystem
 						}
 					}
 				}
+			} finally {
+				LoadLock.Release ();
 			}
 
-			return Task.WhenAll (tasks);
+			await Task.WhenAll (tasks);
 		}
 
 		internal void RemoveProject (MonoDevelop.Projects.Project project)
 		{
 			var id = GetProjectId (project);
 			if (id != null) {
-				foreach (var docId in GetOpenDocumentIds (id).ToList ()) {
-					ClearOpenDocument (docId);
-				}
-
-				ProjectMap.RemoveProject (project, id);
-				UnloadMonoProject (project);
-
 				OnProjectRemoved (id);
 			}
 		}
@@ -1114,7 +1141,7 @@ namespace MonoDevelop.Ide.TypeSystem
 		List<MonoDevelop.Projects.DotNetProject> modifiedProjects = new List<MonoDevelop.Projects.DotNetProject> ();
 		readonly object projectModifyLock = new object ();
 		bool freezeProjectModify;
-		Dictionary<MonoDevelop.Projects.DotNetProject, CancellationTokenSource> projectModifiedCts = new Dictionary<MonoDevelop.Projects.DotNetProject, CancellationTokenSource> ();
+		ConditionalWeakTable<MonoDevelop.Projects.DotNetProject, CancellationTokenSource> projectModifiedCts = new ConditionalWeakTable<MonoDevelop.Projects.DotNetProject, CancellationTokenSource> ();
 		void OnProjectModified (object sender, MonoDevelop.Projects.SolutionItemModifiedEventArgs args)
 		{
 			lock (projectModifyLock) {
@@ -1127,10 +1154,12 @@ namespace MonoDevelop.Ide.TypeSystem
 					if (project == null)
 						return;
 					var projectId = GetProjectId (project);
-					if (projectModifiedCts.TryGetValue (project, out var cts))
+					if (projectModifiedCts.TryGetValue (project, out var cts)) {
 						cts.Cancel ();
+						projectModifiedCts.Remove (project);
+					}
 					cts = new CancellationTokenSource ();
-					projectModifiedCts [project] = cts;
+					projectModifiedCts.Add (project, cts);
 					if (CurrentSolution.ContainsProject (projectId)) {
 						var projectInfo = ProjectHandler.LoadProject (project, cts.Token, null).ContinueWith (t => {
 							if (t.IsCanceled)
